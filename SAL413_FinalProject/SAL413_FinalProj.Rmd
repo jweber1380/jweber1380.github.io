@@ -1,0 +1,226 @@
+---
+title: "SAL413_FinalProject"
+author: "Jared Weber"
+date: "2024-11-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Could a model that just observes that the over under and moneyline of a game predict fantasy defense scores better than ESPN's projections?
+
+```{r}
+library(tidyverse)
+library(nflfastR)
+library(nflreadr)
+library(vtable)
+```
+
+loads in fantasy and betting datsets that filters bye weeks
+
+```{r}
+game_info <- load_schedules(seasons = 2019:2023)
+
+fantasy_info <- read_csv("espnff_player_projections_v2.csv") %>% 
+  filter(default_position == "DEF") %>% 
+  filter(!(projected_points == 0 & actual_points == 0)) %>% 
+  rename("week" = "game_week", "team" = "nfl_team_abbr", "espn_projected_points" = "projected_points")
+```
+
+win probability calculation
+
+```{r}
+game_bet_info <- game_info %>% 
+  select(season, week, away_team, home_team, away_moneyline, home_moneyline, total_line) %>% 
+  mutate(away_implied_win_prob_juiced = ifelse(away_moneyline <= -100,
+                                               1 + 100/(away_moneyline - 100),
+                                               100/(away_moneyline + 100)),
+         home_implied_win_prob_juiced = ifelse(home_moneyline <= -100,
+                                               1 + 100/(home_moneyline - 100),
+                                               100/(home_moneyline + 100)),
+         away_implied_win_prob = away_implied_win_prob_juiced/
+           (away_implied_win_prob_juiced + home_implied_win_prob_juiced),
+         home_implied_win_prob = home_implied_win_prob_juiced/
+           (away_implied_win_prob_juiced + home_implied_win_prob_juiced))
+```
+
+organize game data into team data
+
+```{r}
+game_bet_info_away <- game_bet_info %>% 
+  select(season, week, away_team, total_line, away_implied_win_prob) %>% 
+  rename("team" = "away_team","implied_win_prob" = "away_implied_win_prob")
+
+game_bet_info_home <- game_bet_info %>% 
+  select(season, week, home_team, total_line, home_implied_win_prob)%>% 
+  rename("team" = "home_team","implied_win_prob" = "home_implied_win_prob")
+
+team_bet_info <- rbind(game_bet_info_away, game_bet_info_home) %>% 
+  mutate(team = ifelse(team == "OAK", "LV", team)) %>% 
+  mutate(team = ifelse(team == "LA", "LAR", team))
+```
+
+join data sets and filter into model dataset
+
+```{r}
+fantasy_bet_info <- inner_join(fantasy_info, team_bet_info, by = c('season', 'week', 'team'))
+
+fantasy_bet_info_2019_2022 <- fantasy_bet_info %>% 
+  filter(season %in% c(2019:2022))
+```
+
+preliminary scatter plots
+
+```{r}
+ggplot(fantasy_bet_info, aes(x = implied_win_prob, y = actual_points)) +
+  geom_point() +
+  geom_smooth(method = "lm", formula = y ~ x, size = 1) +
+  scale_x_continuous(labels = scales::comma) +
+  scale_y_continuous(labels = scales::comma)
+
+ggplot(fantasy_bet_info, aes(x = total_line, y = actual_points)) +
+  geom_point() +
+  geom_smooth(method = "lm", formula = y ~ x, size = 1) +
+  scale_x_continuous(labels = scales::comma) +
+  scale_y_continuous(labels = scales::comma)
+```
+
+```{r}
+fantasy_lm = lm(actual_points ~ implied_win_prob + 
+                  total_line + factor(season) + factor(team), 
+                data = fantasy_bet_info_2019_2022)
+summary(fantasy_lm)
+```
+
+builds projection calucation from linear model into test dataset
+
+```{r}
+fantasy_bet_info_2023 <- fantasy_bet_info %>% 
+  filter(season == 2023) %>% 
+  mutate(our_projected_points = round(fantasy_lm$coefficients["(Intercept)"] +
+           fantasy_lm$coefficients["implied_win_prob"] * implied_win_prob +
+           fantasy_lm$coefficients["total_line"] * total_line, 1))
+```
+
+```{r}
+# Function to calculate evaluation metrics
+evaluate_projections <- function(actual, projected) {
+  data.frame(
+    MAE = mean(abs(actual - projected)),
+    RMSE = sqrt(mean((actual - projected)^2))
+  )
+}
+```
+
+mae and rmse are better for us but not significantly different
+
+```{r}
+# Compare projections
+comparison <- bind_rows(
+  Projection_1 = evaluate_projections(fantasy_bet_info_2023$actual_points, 
+                                      fantasy_bet_info_2023$espn_projected_points),
+  Projection_2 = evaluate_projections(fantasy_bet_info_2023$actual_points, 
+                                      fantasy_bet_info_2023$our_projected_points),
+  .id = "Projection"
+)
+```
+
+```{r}
+st(fantasy_bet_info_2023)
+```
+
+our distribution is consistently a few points higher than ESPN
+
+```{r}
+# Reshape the data into long format
+fantasy_bet_info_2023_long <- fantasy_bet_info_2023 %>%
+  select(espn_projected_points, our_projected_points) %>% 
+  pivot_longer(cols = everything(), names_to = "Defense Fantasy Points", values_to = "Projected Fantasy Points")
+
+# Create the density plot
+ggplot(fantasy_bet_info_2023_long, aes(x = `Projected Fantasy Points`, 
+                                       color = `Defense Fantasy Points`, fill = `Defense Fantasy Points`)) +
+  geom_density(alpha = 0.4) +  # alpha controls transparency
+  labs(
+    title = "Density Plot of Defense Fantasy Point Projection",
+    x = "Projected Fantasy Points",
+    y = "Density"
+  ) +
+  theme_minimal()
+```
+
+
+```{r}
+# Reshape the data into long format
+fantasy_bet_info_2023_long <- fantasy_bet_info_2023 %>%
+  select(espn_projected_points, our_projected_points, actual_points) %>% 
+  pivot_longer(cols = everything(), names_to = "Defense Fantasy Points", values_to = "Fantasy Points")
+
+# Create the density plot
+ggplot(fantasy_bet_info_2023_long, aes(x = `Fantasy Points`, 
+                                       color = `Defense Fantasy Points`, fill = `Defense Fantasy Points`)) +
+  geom_density(alpha = 0.4) +  # alpha controls transparency
+  labs(
+    title = "Density Plot of Defense Fantasy Point Projection",
+    x = "Fantasy Points",
+    y = "Density"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+ggplot(fantasy_bet_info_2023, aes(x = espn_projected_points, y = actual_points)) +
+  geom_point() +
+  geom_smooth(method = "lm", formula = y ~ x, size = 1) +
+  scale_x_continuous(labels = scales::comma) +
+  scale_y_continuous(labels = scales::comma)
+
+ggplot(fantasy_bet_info_2023, aes(x = our_projected_points, y = actual_points)) +
+  geom_point() +
+  geom_smooth(method = "lm", formula = y ~ x, size = 1) +
+  scale_x_continuous(labels = scales::comma) +
+  scale_y_continuous(labels = scales::comma)
+```
+
+
+We over predict more often, they under predict more often
+
+```{r}
+# Residual density plot
+residuals <- fantasy_bet_info_2023 %>%
+  mutate(
+    residual_1 = actual_points - espn_projected_points,
+    residual_2 = actual_points - our_projected_points
+  )
+
+ggplot(residuals) +
+  geom_density(aes(x = residual_1, fill = "ESPN Projection"), alpha = 0.5) +
+  geom_density(aes(x = residual_2, fill = "Our Projection"), alpha = 0.5) +
+  labs(title = "Density of Fantasy Point Residuals", x = "Fantasy Point Residuals", y = "Density") +
+  scale_fill_manual(values = c("ESPN Projection" = "blue", "Our Projection" = "red", "Avg Projection" = "green")) +
+  theme_minimal()
+```
+
+average residual for each calculation, ESPN has a more consistent underpredicting bias
+
+```{r}
+fantasy_bet_info_2023 %>%
+  mutate(
+    residual_1 = mean(espn_projected_points - actual_points),
+    residual_2 = mean(our_projected_points - actual_points)
+  ) %>%
+  summarise(
+    ESPN_Bias_Projection = mean(residual_1),
+    Our_Bias_Projection = mean(residual_2)
+  )
+```
+
+Our projections are not that significantly better at projecting fantasy scores but they do not have a consistent over or under prediction issue
+
+```{r}
+t.test(abs(fantasy_bet_info_2023$projected_points - fantasy_bet_info_2023$actual_points),
+       abs(fantasy_bet_info_2023$our_projected_points - fantasy_bet_info_2023$actual_points),
+       paired = TRUE)
+```
